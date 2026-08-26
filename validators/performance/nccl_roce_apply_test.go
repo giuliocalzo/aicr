@@ -16,10 +16,13 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"path/filepath"
 	"testing"
 
+	aicrErrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/validators"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -27,11 +30,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
-// ncclGVRListKinds maps every GVR cleanupNCCLResources / applyNCCLResources
-// touch to a fake list kind, so the dynamic fake client can serve Create/Get/
-// Update/Delete for these CRDs without a real REST mapper.
+// ncclGVRListKinds maps every GVR applyNCCLResources touches to a fake list
+// kind, so the dynamic fake client can serve Create/Get/Update for these CRDs
+// without a real REST mapper.
 var ncclGVRListKinds = map[schema.GroupVersionResource]string{
 	resourceClaimTemplateGVR: "ResourceClaimTemplateList",
 	trainJobGVR:              "TrainJobList",
@@ -115,47 +120,51 @@ func TestCreateOrUpdateFromTemplate_RoCEClaimIdempotent(t *testing.T) {
 }
 
 // TestCleanupNCCLResources_ToleratesMissing verifies the deferred cleanup is
-// safe to run after an early/partial-apply failure: with no resources present,
-// every Delete hits NotFound and the function must complete without panicking.
+// safe to run after an early/partial-apply failure: with no namespace ever
+// created, deleting it must be treated as success (NotFound-tolerant), not
+// an error.
 func TestCleanupNCCLResources_ToleratesMissing(t *testing.T) {
-	const ns = "aicr-validation"
-	// No objects seeded — every Delete returns NotFound.
-	fakeClient := newFakeDynamicClient()
-	cleanupNCCLResources(fakeClient, ns)
-
-	// Cleanup must tolerate the absence, not resurrect anything.
-	_, err := fakeClient.Resource(resourceClaimTemplateGVR).Namespace(ns).
-		Get(context.Background(), ncclRoceClaimName, metav1.GetOptions{})
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("claim should remain absent after cleanup of empty namespace, got err=%v", err)
+	const ns = "aicr-nccl-perf-deadbeef"
+	fakeClient := fake.NewClientset()
+	if err := cleanupNCCLResources(fakeClient, ns); err != nil {
+		t.Fatalf("cleanup of a namespace that was never created should not error, got: %v", err)
 	}
 }
 
-// TestCleanupNCCLResources_DeletesRoCEClaim verifies the happy path: a RoCE
-// claim left in the persistent namespace is deleted by cleanup, so the next run
-// does not collide with it.
-func TestCleanupNCCLResources_DeletesRoCEClaim(t *testing.T) {
-	const ns = "aicr-validation"
+// TestCleanupNCCLResources_DeletesNamespace verifies the happy path: the
+// per-run namespace this run created is deleted, cascading away everything
+// created in it (TrainJob, TrainingRuntime, ComputeDomain, RoCE claim) via
+// ordinary Kubernetes namespace garbage collection — no per-resource
+// tracking required, since nothing else ever shares this namespace.
+func TestCleanupNCCLResources_DeletesNamespace(t *testing.T) {
+	const ns = "aicr-nccl-perf-deadbeef"
+	fakeClient := fake.NewClientset(&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 
-	claim := &unstructured.Unstructured{}
-	claim.SetAPIVersion("resource.k8s.io/v1")
-	claim.SetKind("ResourceClaimTemplate")
-	claim.SetName(ncclRoceClaimName)
-	claim.SetNamespace(ns)
-
-	fakeClient := newFakeDynamicClient(claim)
-
-	// Sanity: the claim exists before cleanup.
-	if _, err := fakeClient.Resource(resourceClaimTemplateGVR).Namespace(ns).
-		Get(context.Background(), ncclRoceClaimName, metav1.GetOptions{}); err != nil {
-		t.Fatalf("precondition: claim should exist before cleanup: %v", err)
+	if err := cleanupNCCLResources(fakeClient, ns); err != nil {
+		t.Fatalf("cleanup should not error, got: %v", err)
 	}
 
-	cleanupNCCLResources(fakeClient, ns)
+	if _, err := fakeClient.CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("namespace should be deleted after cleanup, got err=%v", err)
+	}
+}
 
-	_, err := fakeClient.Resource(resourceClaimTemplateGVR).Namespace(ns).
-		Get(context.Background(), ncclRoceClaimName, metav1.GetOptions{})
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("claim should be deleted after cleanup, got err=%v", err)
+// TestCleanupNCCLResources_ReturnsErrorOnDeleteFailure verifies a delete
+// failure that is not NotFound (e.g. a transient apiserver error) is
+// returned to the caller instead of only logged, so foldCleanupError can
+// still fail an otherwise-passing check on it.
+func TestCleanupNCCLResources_ReturnsErrorOnDeleteFailure(t *testing.T) {
+	const ns = "aicr-nccl-perf-deadbeef"
+	fakeClient := fake.NewClientset(&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+	fakeClient.PrependReactor("delete", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewServiceUnavailable("apiserver is down")
+	})
+
+	err := cleanupNCCLResources(fakeClient, ns)
+	if err == nil {
+		t.Fatal("expected an error from a non-NotFound namespace delete failure, got nil")
+	}
+	if !stderrors.Is(err, aicrErrors.New(aicrErrors.ErrCodeInternal, "")) {
+		t.Errorf("got %v, want an ErrCodeInternal-wrapped delete failure", err)
 	}
 }

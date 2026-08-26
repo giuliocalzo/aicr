@@ -104,10 +104,13 @@ func TestApplyTrainJobWithRetry_RetriesUntilAdmitted(t *testing.T) {
 	client := fakeTrainJobClient(&deny)
 	data := map[string]string{"NAMESPACE": "aicr-validation", "WORKER_COUNT": "2"}
 
-	err := applyTrainJobWithRetry(context.Background(), client, "aicr-validation",
+	created, err := applyTrainJobWithRetry(context.Background(), client, "aicr-validation",
 		filepath.Join("testdata", "trainjob.yaml"), data)
 	if err != nil {
 		t.Fatalf("expected TrainJob to be admitted after retries, got %v", err)
+	}
+	if created == nil {
+		t.Fatal("expected the created TrainJob to be returned for ownership tracking, got nil")
 	}
 	if deny != 0 {
 		t.Errorf("expected all %d denials to be consumed, %d remaining", 2, deny)
@@ -124,7 +127,7 @@ func TestApplyTrainJobWithRetry_PropagatesNonRaceError(t *testing.T) {
 	})
 	data := map[string]string{"NAMESPACE": "aicr-validation", "WORKER_COUNT": "2"}
 
-	err := applyTrainJobWithRetry(context.Background(), client, "aicr-validation",
+	_, err := applyTrainJobWithRetry(context.Background(), client, "aicr-validation",
 		filepath.Join("testdata", "trainjob.yaml"), data)
 	if err == nil {
 		t.Fatal("expected non-race error to propagate, got nil")
@@ -148,7 +151,7 @@ func TestApplyTrainJobWithRetry_TimeoutClassifiedWhenBudgetExpiresMidCreate(t *t
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // budget already exhausted before the first create returns
 
-	err := applyTrainJobWithRetry(ctx, client, "aicr-validation",
+	_, err := applyTrainJobWithRetry(ctx, client, "aicr-validation",
 		filepath.Join("testdata", "trainjob.yaml"), data)
 	if err == nil {
 		t.Fatal("expected a timeout error, got nil")
@@ -170,7 +173,7 @@ func TestApplyTrainJobWithRetry_TimesOutWhenWebhookNeverCatchesUp(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), admissionRetryGiveUpTimeout)
 	defer cancel()
 
-	err := applyTrainJobWithRetry(ctx, client, "aicr-validation",
+	_, err := applyTrainJobWithRetry(ctx, client, "aicr-validation",
 		filepath.Join("testdata", "trainjob.yaml"), data)
 	if err == nil {
 		t.Fatal("expected a timeout error, got nil")
